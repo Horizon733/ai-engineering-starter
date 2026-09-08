@@ -1,20 +1,27 @@
-"""The six steps, one function each.
+import os
+import tempfile
 
-LOAD -> CHUNK -> EMBED+STORE -> FIND -> ANSWER
-Two of them decide everything: how you cut it up, and what comes back.
-"""
+import chromadb
+import streamlit as st
+from dotenv import load_dotenv
+from groq import Groq
+from pypdf import PdfReader
 
-from __future__ import annotations
+load_dotenv()
 
-import hashlib
-import re
-import sys
-from dataclasses import dataclass
-from pathlib import Path
+# ---------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------
 
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+CHROMA_PATH = os.getenv("CHROMA_PATH", "./chroma_data")
 
-from config import Settings  # noqa: E402
+if not os.getenv("GROQ_API_KEY"):
+    st.error("GROQ_API_KEY is not configured.")
+    st.stop()
+
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+chroma = chromadb.PersistentClient(path=CHROMA_PATH)
 
 SYSTEM_PROMPT = """You answer questions using only the context below, taken from one PDF.
 
@@ -24,120 +31,404 @@ If the context does not contain the answer, say exactly: "That isn't in this doc
 Answer in Markdown, and keep it short."""
 
 
-@dataclass(frozen=True)
-class Chunk:
-    text: str
-    page: int
+# ---------------------------------------------------------
+# 1. LOAD
+# ---------------------------------------------------------
 
-
-# 1. LOAD — pages to text, page numbers kept, because that is the citation later.
-def load_pdf(path: Path) -> list[tuple[int, str]]:
-    from pypdf import PdfReader
-
-    reader = PdfReader(str(path))
+def load_pdf(path):
     pages = []
-    for number, page in enumerate(reader.pages, start=1):
+
+    for number, page in enumerate(PdfReader(path).pages, start=1):
         text = (page.extract_text() or "").strip()
+
         if text:
             pages.append((number, text))
+
     return pages
 
 
-# 2. CHUNK — split on paragraphs, overlap a little, never lose the page.
-def chunk_pages(pages: list[tuple[int, str]], chunk_size: int, overlap: int) -> list[Chunk]:
-    chunks: list[Chunk] = []
+# ---------------------------------------------------------
+# 2. CHUNK
+# ---------------------------------------------------------
+
+def chunk_pages(pages, chunk_size=1000, overlap=200):
+    chunks = []
+
+    step = chunk_size - overlap
 
     for page_number, text in pages:
-        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
-        buffer = ""
+        for start in range(0, len(text), step):
+            piece = text[start:start + chunk_size].strip()
 
-        for paragraph in paragraphs:
-            if len(buffer) + len(paragraph) + 2 <= chunk_size:
-                buffer = f"{buffer}\n\n{paragraph}" if buffer else paragraph
-                continue
-            tail = ""
-            if buffer:
-                chunks.append(Chunk(buffer, page_number))
-                tail = buffer[-overlap:] if overlap else ""
-                buffer = ""
-
-            if len(paragraph) > chunk_size:
-                # One paragraph longer than a whole chunk: cut it straight, and accept the loss.
-                step = max(1, chunk_size - overlap)
-                for start in range(0, len(paragraph), step):
-                    piece = paragraph[start : start + chunk_size]
-                    if piece.strip():
-                        chunks.append(Chunk(piece, page_number))
-            else:
-                buffer = f"{tail}\n\n{paragraph}" if tail else paragraph
-
-        if buffer:
-            chunks.append(Chunk(buffer, page_number))
+            if piece:
+                chunks.append((page_number, piece))
 
     return chunks
 
 
-def collection_name(path: Path) -> str:
-    digest = hashlib.sha1(path.name.encode()).hexdigest()[:8]
-    return f"pdf_{digest}"
+# ---------------------------------------------------------
+# 3. EMBED + STORE
+# ---------------------------------------------------------
 
+def build_store(name, chunks):
+    try:
+        chroma.delete_collection(name)
+    except Exception:
+        pass
 
-# 3. EMBED + STORE — Chroma turns each chunk into numbers and remembers them.
-def build_store(settings: Settings, name: str, chunks: list[Chunk]):
-    import chromadb
-
-    client = chromadb.PersistentClient(path=str(settings.chroma_path))
-    # chroma returns names on newer versions, collection objects on older ones
-    existing = {c if isinstance(c, str) else c.name for c in client.list_collections()}
-    if name in existing:
-        client.delete_collection(name)  # so a re-index starts clean
-    collection = client.create_collection(name)
+    collection = chroma.create_collection(name)
 
     collection.add(
-        ids=[f"{name}-{i}" for i in range(len(chunks))],
-        documents=[c.text for c in chunks],
-        metadatas=[{"page": c.page} for c in chunks],
+        ids=[str(i) for i in range(len(chunks))],
+        documents=[text for _, text in chunks],
+        metadatas=[{"page": page} for page, _ in chunks],
     )
+
     return collection
 
 
-def open_store(settings: Settings, name: str):
-    import chromadb
+# ---------------------------------------------------------
+# 4. FIND
+# ---------------------------------------------------------
 
-    client = chromadb.PersistentClient(path=str(settings.chroma_path))
-    return client.get_collection(name)
+def find(name, question, top_k=4):
+    collection = chroma.get_collection(name)
 
-
-# 4. FIND — your question goes in, the nearest pieces come back. Look here first when it's wrong.
-def find(collection, question: str, top_k: int) -> list[Chunk]:
-    result = collection.query(query_texts=[question], n_results=top_k)
-    documents = result["documents"][0]
-    metadatas = result["metadatas"][0]
-    return [Chunk(doc, int(meta["page"])) for doc, meta in zip(documents, metadatas)]
-
-
-def format_context(chunks: list[Chunk]) -> str:
-    return "\n\n".join(f"[page {c.page}]\n{c.text}" for c in chunks)
-
-
-# 5. ANSWER — one instruction does more work here than any framework.
-def answer(settings: Settings, question: str, chunks: list[Chunk]) -> str:
-    if not settings.groq_api_key:
-        raise ValueError("GROQ_API_KEY is missing. Copy .env.example to .env and fill it in.")
-
-    from groq import Groq
-
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": f"Context:\n---\n{format_context(chunks)}\n---\n\nQuestion: {question}",
-        },
-    ]
-
-    response = Groq(api_key=settings.groq_api_key).chat.completions.create(
-        model=settings.groq_model,
-        messages=messages,
-        temperature=0.1,
+    result = collection.query(
+        query_texts=[question],
+        n_results=top_k,
     )
-    return response.choices[0].message.content or ""
+
+    return list(
+        zip(
+            [m["page"] for m in result["metadatas"][0]],
+            result["documents"][0],
+        )
+    )
+
+
+# ---------------------------------------------------------
+# 5. ANSWER
+# ---------------------------------------------------------
+
+def answer(question, chunks):
+    context = "\n\n".join(
+        f"[page {page}]\n{text}"
+        for page, text in chunks
+    )
+
+    response = client.chat.completions.create(
+        model=MODEL,
+        temperature=0.1,
+        messages=[
+            {
+                "role": "system",
+                "content": SYSTEM_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Context:\n"
+                    f"---\n"
+                    f"{context}\n"
+                    f"---\n\n"
+                    f"Question: {question}"
+                ),
+            },
+        ],
+    )
+
+    return response.choices[0].message.content
+
+
+# ---------------------------------------------------------
+# STREAMLIT UI
+# ---------------------------------------------------------
+
+st.set_page_config(
+    page_title="Simple RAG",
+    page_icon="📚",
+    layout="wide",
+)
+
+st.title("📚 Simple PDF RAG")
+
+st.caption(
+    "LOAD → CHUNK → EMBED + STORE → FIND → ANSWER"
+)
+
+# ---------------------------------------------------------
+# SIDEBAR
+# ---------------------------------------------------------
+
+with st.sidebar:
+    st.header("⚙️ RAG Settings")
+
+    chunk_size = st.slider(
+        "Chunk size",
+        min_value=300,
+        max_value=3000,
+        value=1000,
+        step=100,
+    )
+
+    overlap = st.slider(
+        "Chunk overlap",
+        min_value=0,
+        max_value=800,
+        value=200,
+        step=50,
+    )
+
+    top_k = st.slider(
+        "Retrieved chunks (Top K)",
+        min_value=1,
+        max_value=10,
+        value=4,
+    )
+
+    st.divider()
+
+    st.caption(f"Model: `{MODEL}`")
+    st.caption(f"Chroma: `{CHROMA_PATH}`")
+
+
+# ---------------------------------------------------------
+# PDF UPLOAD
+# ---------------------------------------------------------
+
+st.subheader("1️⃣ Upload your PDF")
+
+uploaded_file = st.file_uploader(
+    "Choose a PDF",
+    type=["pdf"],
+)
+
+if uploaded_file:
+
+    st.success(
+        f"Loaded: **{uploaded_file.name}**"
+    )
+
+    # Create temporary PDF file
+    with tempfile.NamedTemporaryFile(
+        delete=False,
+        suffix=".pdf",
+    ) as tmp:
+
+        tmp.write(uploaded_file.getvalue())
+        pdf_path = tmp.name
+
+    # Collection name based on session
+    collection_name = "pdf_rag"
+
+    if st.button(
+        "🔨 Index PDF",
+        type="primary",
+        use_container_width=True,
+    ):
+
+        with st.status(
+            "Building RAG index...",
+            expanded=True,
+        ) as status:
+
+            # LOAD
+            st.write("📄 Loading PDF...")
+
+            pages = load_pdf(pdf_path)
+
+            st.write(
+                f"Found **{len(pages)} pages**."
+            )
+
+            # CHUNK
+            st.write("✂️ Creating chunks...")
+
+            chunks = chunk_pages(
+                pages,
+                chunk_size=chunk_size,
+                overlap=overlap,
+            )
+
+            st.write(
+                f"Created **{len(chunks)} chunks**."
+            )
+
+            # EMBED + STORE
+            st.write("🧠 Embedding + storing...")
+
+            build_store(
+                collection_name,
+                chunks,
+            )
+
+            # Save state
+            st.session_state["indexed"] = True
+            st.session_state["pdf_name"] = uploaded_file.name
+            st.session_state["pages"] = pages
+            st.session_state["chunks"] = chunks
+            st.session_state["collection_name"] = collection_name
+
+            status.update(
+                label="RAG index ready!",
+                state="complete",
+            )
+
+
+# ---------------------------------------------------------
+# INDEX INFO
+# ---------------------------------------------------------
+
+if st.session_state.get("indexed"):
+
+    st.divider()
+
+    st.subheader("📊 Index")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.metric(
+            "Pages",
+            len(st.session_state["pages"]),
+        )
+
+    with col2:
+        st.metric(
+            "Chunks",
+            len(st.session_state["chunks"]),
+        )
+
+    with col3:
+        st.metric(
+            "Chunk size",
+            chunk_size,
+        )
+
+    # -----------------------------------------------------
+    # CHUNK INSPECTOR
+    # -----------------------------------------------------
+
+    with st.expander("🔍 Inspect chunks"):
+
+        chunks = st.session_state["chunks"]
+
+        for i, (page, text) in enumerate(chunks[:20]):
+
+            st.markdown(
+                f"**Chunk {i + 1} — Page {page}**"
+            )
+
+            st.code(
+                text,
+                language="text",
+            )
+
+            st.divider()
+
+
+# ---------------------------------------------------------
+# QUESTION ANSWERING
+# ---------------------------------------------------------
+
+if st.session_state.get("indexed"):
+
+    st.divider()
+
+    st.subheader("2️⃣ Ask questions")
+
+    question = st.text_input(
+        "Ask something about your PDF",
+        placeholder="What is this document about?",
+    )
+
+    if st.button(
+        "🚀 Ask",
+        type="primary",
+        disabled=not question,
+    ):
+
+        with st.spinner("Searching the document..."):
+
+            # FIND
+            retrieved_chunks = find(
+                st.session_state["collection_name"],
+                question,
+                top_k=top_k,
+            )
+
+        # -------------------------------------------------
+        # RETRIEVAL RESULTS
+        # -------------------------------------------------
+
+        st.subheader("🔎 Retrieved Context")
+
+        for i, (page, text) in enumerate(
+            retrieved_chunks,
+            start=1,
+        ):
+
+            with st.expander(
+                f"Chunk {i} — Page {page}",
+                expanded=False,
+            ):
+
+                st.write(text)
+
+        # -------------------------------------------------
+        # ANSWER
+        # -------------------------------------------------
+
+        with st.spinner("Generating answer..."):
+
+            response = answer(
+                question,
+                retrieved_chunks,
+            )
+
+        st.subheader("💬 Answer")
+
+        st.markdown(response)
+
+
+# ---------------------------------------------------------
+# EMPTY STATE
+# ---------------------------------------------------------
+
+else:
+
+    st.info(
+        "Upload a PDF and click **Index PDF** to start."
+    )
+
+    st.markdown(
+        """
+### How this RAG works
+
+```text
+PDF
+ │
+ ▼
+LOAD
+ │
+ ▼
+CHUNK
+ │
+ ▼
+EMBED + STORE
+ │
+ ▼
+FIND
+ │
+ ▼
+ANSWER
+````
+
+The important knobs are:
+
+* **Chunk size** → how much text goes into each chunk
+* **Overlap** → how much neighboring chunks share
+* **Top K** → how many chunks are retrieved
+  """
+  )
